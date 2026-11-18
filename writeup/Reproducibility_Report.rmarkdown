@@ -6,6 +6,8 @@ format:
   pdf:
     toc: true
     toc_depth: 3
+editor_options: 
+  chunk_output_type: inline
 ---
 
 <!-- Reproducibility reports should all use this template to standardize reporting across projects. These reports will be public supplementary materials that accompany the summary report(s) of the aggregate results. -->
@@ -66,12 +68,14 @@ library(here)
 library(tidyverse)
 library(lme4)
 library(lmerTest)
+library(assertthat)
 
 ```
 
 ```{r}
-
 #cleaning for fig 3b
+
+#| cache: true
 
 #### Function that cleans one bird's raw file
 clean_bird <- function(path) {
@@ -518,6 +522,8 @@ simulate_cells <- function(cells, morph_pars, beta, sd_u) {
 
 ### Recover parameters from simulated cells
 
+#| cache: true
+
 recover_effect <- function(cells_k) {          
   fits <- cells_k |>
     mutate(p_right = k / n_trials) |>
@@ -547,6 +553,7 @@ recover_effect <- function(cells_k) {
     beta_hat      = if (is.null(m)) NA_real_ else fixef(m)[["pl_c"]],
     se            = if (is.null(m)) NA_real_ else coef(summary(m))["pl_c", "Std. Error"],
     sd_u_hat      = if (is.null(m)) NA_real_ else attr(VarCorr(m)$bird, "stddev")[["pl_c"]],
+    p_value       = if (is.null(m)) NA_real_ else coef(summary(m))["pl_c", "Pr(>|t|)"],
     singular      = if (is.null(m)) NA else isSingular(m)
   )
 }
@@ -582,6 +589,300 @@ sims |>
 write_csv(sims, here("data", "clean", "simulation_results_sd_u_1.25.csv"))
 
 ```
+```{r}
+#simulate null hypothesis dataset (bird variation remains)
+
+#| cache: true
+
+set.seed(2027)   
+n_sims <- 200    
+
+sims_null <- map(seq_len(n_sims),
+                 \(i) recover_effect(simulate_cells(cells, morph_pars, beta = 0, sd_u = sd_u_sim)),
+                 .progress = TRUE) |>
+  list_rbind() |>
+  mutate(sim = row_number())
+
+write_csv(sims_null, here("data", "clean", "simulation_results_null.csv"))
+
+#### Summary
+sims_null |>
+  summarise(
+    mean_beta_hat  = mean(beta_hat, na.rm = TRUE),                  # should be near 0
+    sd_beta_hat    = sd(beta_hat, na.rm = TRUE),
+    bias_se        = sd_beta_hat / sqrt(sum(!is.na(beta_hat))),     # is the mean distinguishable from 0?
+    mean_se        = mean(se, na.rm = TRUE),                        # should be close to sd_beta_hat
+    false_pos_rate = mean(p_value < 0.05, na.rm = TRUE),            # should be near 0.05
+    mean_sd_u_hat  = mean(sd_u_hat, na.rm = TRUE),
+    pct_singular   = mean(singular, na.rm = TRUE),
+    pct_failed     = mean(n_failed / n_fits)
+  )
+
+```
+
+
+``` {r}
+#cleaning for 3-panel 3f comparison
+
+#### Returns the kept morph-level fits (same filters as 3f) for one dataset
+recover_fits <- function(cells_k) {          # needs columns n_trials and k
+  cells_k |>
+    mutate(p_right = k / n_trials) |>
+    group_by(bird, interpolation, cue_class, p_signal_left) |>
+    nest() |>
+    mutate(
+      model = map(data, \(d) suppressWarnings(possibly(fit_logistic, otherwise = NULL)(d))),
+      inflection = map_dbl(model, \(m) if (is.null(m)) NA_real_ else coef(m)[["inflection"]])
+    ) |>
+    ungroup() |>
+    filter(!is.na(inflection), inflection > 1.5, inflection < 127.5) |>
+    select(bird, interpolation, cue_class, p_signal_left, inflection)
+}
+
+#### Real data (saved at the end of the 3f cleaning chunk)
+real_fits <- read_csv(here("data", "clean", "inflection_by_cue.csv"), show_col_types = FALSE) |>
+  select(bird, interpolation, cue_class, p_signal_left, inflection)
+
+#### One simulated dataset with the real effect, one with the null
+set.seed(2028)
+sim_effect_fits <- recover_fits(simulate_cells(cells, morph_pars, beta_true, sd_u_sim))
+sim_null_fits   <- recover_fits(simulate_cells(cells, morph_pars, beta = 0, sd_u = sd_u_sim))
+
+#### Checks: all three should be close to 1,050 fits
+c(real = nrow(real_fits), effect = nrow(sim_effect_fits), null = nrow(sim_null_fits))
+
+write_csv(sim_effect_fits, here("data", "clean", "sim_effect_fits.csv"))
+write_csv(sim_null_fits,   here("data", "clean", "sim_null_fits.csv"))
+
+```
+
+```{r}
+#plotting for 3-panel fig 3f comparison
+
+### Figure 3f: real data vs. simulated effect vs. simulated null
+
+#| fig-width: 6
+#| fig-height: 9
+
+#### Stack the three datasets, with panel labels
+panel_levels <- c("Real data", "Simulated: real effect", "Simulated: null effect")
+
+all_fits <- bind_rows(
+  "Real data"              = real_fits,
+  "Simulated: real effect" = sim_effect_fits,
+  "Simulated: null effect" = sim_null_fits,
+  .id = "dataset"
+) |>
+  mutate(dataset = factor(dataset, levels = panel_levels))
+
+### Assertthat sanity checks before plotting
+#### 1. Structure: required columns and the three expected datasets
+assert_that(
+  has_name(all_fits, c("dataset", "bird", "interpolation", "cue_class",
+                       "p_signal_left", "inflection")),
+  msg = "all_fits is missing one of the required columns"
+)
+
+expected_panels <- c("Real data", "Simulated: real effect", "Simulated: null effect")
+assert_that(
+  setequal(levels(all_fits$dataset), expected_panels),
+  msg = "dataset should have exactly the three panel labels"
+)
+
+#### 2. Values: no missing inflections, all inside the range nls was allowed to return
+assert_that(
+  noNA(all_fits$inflection),
+  msg = "There are NA inflection values; failed fits should have been dropped"
+)
+assert_that(
+  all(all_fits$inflection > 1.5 & all_fits$inflection < 127.5),
+  msg = "Some inflections sit at the nls bounds; they should have been filtered out"
+)
+
+#### 3. Cue coding: only the five expected P(reinforce left) values
+assert_that(
+  all(round(all_fits$p_signal_left, 3) %in% c(0.125, 0.25, 0.5, 0.75, 0.875)),
+  msg = "Unexpected p_signal_left values found"
+)
+
+#### 4. Sample size: each panel should be close to the paper's n = 1,050
+counts <- all_fits |> count(dataset)
+print(counts)
+assert_that(
+  all(counts$n >= 1000 & counts$n <= 1050),
+  msg = "A panel has fewer than 1,000 or more than 1,050 fits; check failed fits and CN handling"
+)
+
+#### 5. Coverage: all 20 birds in every panel, and no duplicated fits
+birds_per_panel <- all_fits |> group_by(dataset) |> summarise(n_birds = n_distinct(bird))
+assert_that(
+  all(birds_per_panel$n_birds == 20),
+  msg = "A panel does not contain all 20 birds"
+)
+
+dupes <- all_fits |> count(dataset, bird, interpolation, cue_class, p_signal_left) |> filter(n > 1)
+assert_that(
+  nrow(dupes) == 0,
+  msg = "Duplicate bird x morph x cue-condition fits found"
+)
+
+#### 6. Direction of the effect (the sign check we used throughout)
+slopes <- all_fits |>
+  group_by(dataset) |>
+  summarise(fit = list(lm(inflection ~ p_signal_left)), .groups = "drop") |>
+  mutate(slope = map_dbl(fit, \(m) coef(m)[["p_signal_left"]]),
+         se    = map_dbl(fit, \(m) coef(summary(m))["p_signal_left", "Std. Error"]))
+print(slopes |> select(dataset, slope, se))
+
+slope_of <- function(panel) slopes$slope[slopes$dataset == panel]
+se_of    <- function(panel) slopes$se[slopes$dataset == panel]
+
+# These two are deterministic expectations: they should always be clearly positive
+assert_that(slope_of("Real data") > 0,
+            msg = "Real data slope is not positive: check orientation / L-R coding")
+assert_that(slope_of("Simulated: real effect") > 0,
+            msg = "Simulated-effect slope is not positive")
+
+# The null check is statistical, so one random draw can wander. Warn instead of stopping.
+null_ok <- see_if(
+  abs(slope_of("Simulated: null effect")) < 3 * se_of("Simulated: null effect"),
+  msg = "Null-panel slope is more than 3 SE from zero; check for a bug, or try another seed"
+)
+if (!null_ok) warning(attr(null_ok, "msg"))
+
+message("All 3f data checks passed")
+
+#### Colors: maroon -> blue like the paper, gray for the 0.5 conditions
+cue_colors <- c("0.125" = "#7b1e4a", "0.25" = "#c0447f", "0.5" = "gray40",
+                "0.75" = "#6a5acd", "0.875" = "#2b2a73")
+
+#### Bird-level means (colored triangles), per panel
+bird_means <- all_fits |>
+  group_by(dataset, bird, p_signal_left) |>
+  summarise(inflection = mean(inflection), .groups = "drop")
+
+#### Across-bird means with s.e.m. (black triangles and error bars), per panel
+cue_means <- bird_means |>
+  group_by(dataset, p_signal_left) |>
+  summarise(
+    mean_inflection = mean(inflection),
+    sem = sd(inflection) / sqrt(n()),
+    .groups = "drop"
+  )
+
+#### r² and P for each panel (Pearson, over all morph-level fits)
+stat_labels <- all_fits |>
+  group_by(dataset) |>
+  summarise(ct = list(cor.test(p_signal_left, inflection)), .groups = "drop") |>
+  mutate(label = map_chr(ct, \(x) paste0("r² = ", sprintf("%.3f", x$estimate^2),
+                                         "\nP = ", format.pval(x$p.value, digits = 2))))
+
+#### Plot
+p <- ggplot() +
+  geom_jitter(data = all_fits,
+              aes(x = p_signal_left, y = inflection, color = factor(p_signal_left)),
+              width = 0.02, height = 0, size = 1, alpha = 0.3) +
+  geom_point(data = bird_means,
+             aes(x = p_signal_left, y = inflection, color = factor(p_signal_left)),
+             shape = 17, size = 2, alpha = 0.8,
+             position = position_jitter(width = 0.02, height = 0)) +
+  geom_smooth(data = all_fits,
+              aes(x = p_signal_left, y = inflection),
+              method = "lm", se = FALSE,
+              color = "black", linetype = "dashed", linewidth = 0.8) +
+  geom_errorbar(data = cue_means,
+                aes(x = p_signal_left,
+                    ymin = mean_inflection - sem, ymax = mean_inflection + sem),
+                width = 0.03, color = "black") +
+  geom_point(data = cue_means,
+             aes(x = p_signal_left, y = mean_inflection),
+             shape = 17, size = 3, color = "black") +
+  geom_text(data = stat_labels,
+            aes(x = 0.08, y = Inf, label = label),
+            hjust = 0, vjust = 1.3, size = 3.5, inherit.aes = FALSE) +
+  facet_wrap(~ dataset, ncol = 1) +
+  scale_color_manual(values = cue_colors, guide = "none") +
+  scale_x_continuous(breaks = c(0.2, 0.4, 0.6, 0.8)) +
+  coord_cartesian(xlim = c(0.05, 0.95)) +
+  labs(x = "P(reinforce left | cue)", y = "Inflection") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p)
+
+```
+
+```{r}
+#cleaning for 3-panel 3e comparison
+
+#### Read the saved morph-level fits (the same ones used for the 3f comparison)
+read_fits <- function(file) {
+  read_csv(here("data", "clean", file), show_col_types = FALSE) |>
+    select(bird, interpolation, cue_class, p_signal_left, inflection)
+}
+
+all_fits <- bind_rows(
+  "Real data"              = read_fits("inflection_by_cue.csv"),
+  "Simulated: real effect" = read_fits("sim_effect_fits.csv"),
+  "Simulated: null effect" = read_fits("sim_null_fits.csv"),
+  .id = "dataset"
+) |>
+  mutate(dataset = factor(dataset, levels = c("Real data", "Simulated: real effect",
+                                              "Simulated: null effect")))
+
+#### Keep the informative cues (CL = left cue, CR = right cue) at 0.75 and 0.875
+# p_signal_left is the P(reinforce left), so for a right cue the cue strength is 1 - p_signal_left
+delta <- all_fits |>
+  filter(cue_class %in% c("CL", "CR")) |>
+  mutate(cue_prob = round(if_else(cue_class == "CL", p_signal_left, 1 - p_signal_left), 3)) |>
+  filter(cue_prob %in% c(0.75, 0.875)) |>
+  select(dataset, bird, interpolation, cue_prob, cue_class, inflection) |>
+  pivot_wider(names_from = cue_class, values_from = inflection) |>
+  drop_na(CL, CR) |>
+  mutate(delta_inflection = CL - CR)    # left-cue minus right-cue, as in the 3e code
+
+#### Checks
+delta |> count(dataset, cue_prob)    # the real data should be near your earlier counts
+delta |>
+  group_by(dataset, cue_prob) |>
+  summarise(mean_delta = mean(delta_inflection),
+            sd_delta   = sd(delta_inflection),
+            .groups = "drop")
+# real and simulated-effect means should be positive; the null means should be near 0
+
+```
+
+```{r}
+#### Plot the distribution of ΔInflection for each cue strength, one panel per dataset
+binwidth <- 2
+
+pl <- ggplot(delta, aes(x = delta_inflection,
+                       fill = factor(cue_prob),
+                       color = factor(cue_prob))) +
+  geom_histogram(aes(y = after_stat(density) * binwidth),
+                 binwidth = binwidth, position = "identity",
+                 alpha = 0.5, color = NA) +
+  geom_density(aes(y = after_stat(density) * binwidth),
+               fill = NA, linewidth = 0.8, adjust = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~ dataset, ncol = 1) +
+  scale_fill_manual(values  = c("0.75" = "gray70", "0.875" = "gray30"),
+                    labels  = c("0.75" = "P(side) = 0.75", "0.875" = "P(side) = 0.875"),
+                    name = NULL) +
+  scale_color_manual(values = c("0.75" = "gray70", "0.875" = "gray30"),
+                     labels = c("0.75" = "P(side) = 0.75", "0.875" = "P(side) = 0.875"),
+                     name = NULL) +
+  coord_cartesian(xlim = c(-20, 20)) +
+  labs(x = "ΔInflection", y = "Probability") +
+  theme_classic() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"),
+        legend.position = "top")
+
+print(pl)
+```
+
 *Side-by-side graph with original graph is ideal here*
 
 ### Exploratory analyses
@@ -608,3 +909,4 @@ Open the discussion section with a paragraph summarizing the primary result from
 ### Commentary
 
 Add open-ended commentary (if any) reflecting (a) insights from follow-up exploratory analysis of the dataset, (b) assessment of the meaning of the successful or unsuccessful reproducibility attempt - e.g., for a failure to reproduce the original findings, are the differences between original and present analyses ones that definitely, plausibly, or are unlikely to have been moderators of the result, and (c) discussion of any objections or challenges raised by the current and original authors about the reproducibility attempt (if you contacted them).  None of these need to be long.
+
