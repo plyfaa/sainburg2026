@@ -60,12 +60,18 @@ Data preparation following the analysis plan.
 
 
 ``` {r}
-#cleaning for fig 3b
 
 #### Load Relevant Libraries and Functions
 library(here)
 library(tidyverse)
 library(lme4)
+library(lmerTest)
+
+```
+
+```{r}
+
+#cleaning for fig 3b
 
 #### Function that cleans one bird's raw file
 clean_bird <- function(path) {
@@ -417,11 +423,163 @@ ggplot() +
 ```
 ```{r}
 # linear mixed effects model
-lmer(inflection ~ p_signal_right + (p_signal_right | bird), data = fits_clean)
+m <- lmer(inflection ~ p_signal_right + (p_signal_right | bird), data = fits_clean)
+summary(m) 
+confint(m, method = "Wald")
 ```
 
 ```{r}
-# data simulation
+
+### Simulation setup
+
+set.seed(2026)
+
+#### Real trial structure, collapsed to one row per cell
+df_all <- read_csv(here("data", "clean", "all_birds_clean.csv.gz"), show_col_types = FALSE)
+
+cells <- df_all |>
+  group_by(bird, interpolation, cue_class, p_signal_left, interpolation_point) |>
+  summarise(n_trials = n(), k_real = sum(response_bool), .groups = "drop")
+
+#### Four-parameter logistic
+logistic4 <- function(x, p_min, p_max, inflection, slope) {
+  p_max + (p_min - p_max) / (1 + (x / inflection)^slope)
+}
+
+# same fit as 3b/3e/3f
+fit_logistic <- function(d) {
+  nls(
+    p_right ~ p_max + (p_min - p_max) / (1 + (interpolation_point / inflection)^slope),
+    data = d,
+    weights = n_trials,
+    start = list(p_min = 0.1, p_max = 0.9, inflection = 64, slope = 10),
+    algorithm = "port",
+    lower = c(p_min = 0,   p_max = 0.5, inflection = 1,   slope = 0.1),
+    upper = c(p_min = 0.5, p_max = 1,   inflection = 128, slope = 100)
+  )
+}
+
+#### Baseline curve for each bird x morph, fit to the real no-cue (NC) trials
+nc_fits <- cells |>
+  filter(cue_class == "NC") |>
+  mutate(p_right = k_real / n_trials) |>
+  group_by(bird, interpolation) |>
+  nest() |>
+  mutate(par = map(data, \(d) {
+    m <- suppressWarnings(possibly(fit_logistic, otherwise = NULL)(d))
+    if (is.null(m)) {
+      tibble(p_min = NA_real_, p_max = NA_real_, base_infl = NA_real_, slope = NA_real_)
+    } else {
+      as_tibble_row(coef(m)) |> rename(base_infl = inflection)
+    }
+  })) |>
+  ungroup() |>
+  select(-data) |>
+  unnest(par)
+
+sum(is.na(nc_fits$base_infl))   # how many baseline fits failed
+
+# failed fits borrow the median of the successful ones
+morph_pars <- nc_fits |>
+  mutate(across(c(p_min, p_max, base_infl, slope),
+                \(x) if_else(is.na(x), median(x, na.rm = TRUE), x)))
+
+#### Truth: start from the real LMM (in terms of p_signal_left, centered at 0.5)
+real_fits <- read_csv(here("data", "clean", "inflection_by_cue.csv"), show_col_types = FALSE) |>
+  mutate(pl_c = p_signal_left - 0.5)
+
+m_real <- lmer(inflection ~ pl_c + (1 + pl_c | bird), data = real_fits)
+beta_true <- fixef(m_real)[["pl_c"]]                           # positive, about +11.8
+sd_u_true <- attr(VarCorr(m_real)$bird, "stddev")[["pl_c"]]    # bird-level SD of the shift
+sd_u_sim  <- sd_u_true * 1.25    # tuning factor; adjust after each trial run
+c(beta_true = beta_true, sd_u_true = sd_u_true)
+# can overwrite these^ with round numbers to test a specific scenario
+
+#### Simulator: keeps the real trial counts, replaces only the responses
+simulate_cells <- function(cells, morph_pars, beta, sd_u) {
+  birds <- tibble(bird = unique(cells$bird)) |>
+    mutate(u_bird = rnorm(n(), 0, sd_u))        # new bird-level shift deviations each call
+
+  cells |>
+    left_join(birds, by = "bird") |>
+    left_join(morph_pars, by = c("bird", "interpolation")) |>
+    mutate(
+      infl = pmin(pmax(base_infl + (beta + u_bird) * (p_signal_left - 0.5), 1), 128),
+      p    = logistic4(interpolation_point, p_min, p_max, infl, slope),
+      k    = rbinom(n(), n_trials, p)
+    ) |>
+    select(bird, interpolation, cue_class, p_signal_left,
+           interpolation_point, n_trials, k)
+}
+
+```
+
+``` {r}
+
+### Recover parameters from simulated cells
+
+recover_effect <- function(cells_k) {          
+  fits <- cells_k |>
+    mutate(p_right = k / n_trials) |>
+    group_by(bird, interpolation, cue_class, p_signal_left) |>
+    nest() |>
+    mutate(
+      model = map(data, \(d) suppressWarnings(possibly(fit_logistic, otherwise = NULL)(d))),
+      inflection = map_dbl(model, \(m) if (is.null(m)) NA_real_ else coef(m)[["inflection"]])
+    ) |>
+    ungroup()
+
+  good <- fits |>
+    filter(!is.na(inflection), inflection > 1.5, inflection < 127.5) |>
+    mutate(pl_c = p_signal_left - 0.5)
+
+  m <- tryCatch(
+    suppressMessages(suppressWarnings(
+      lmer(inflection ~ pl_c + (1 + pl_c | bird), data = good))),
+    error = \(e) NULL)
+
+  tibble(
+    n_fits        = nrow(fits),
+    n_failed      = sum(is.na(fits$inflection)),
+    n_kept        = nrow(good),
+    sd_inflection = sd(good$inflection),
+    r2            = cor(good$p_signal_left, good$inflection)^2,
+    beta_hat      = if (is.null(m)) NA_real_ else fixef(m)[["pl_c"]],
+    se            = if (is.null(m)) NA_real_ else coef(summary(m))["pl_c", "Std. Error"],
+    sd_u_hat      = if (is.null(m)) NA_real_ else attr(VarCorr(m)$bird, "stddev")[["pl_c"]],
+    singular      = if (is.null(m)) NA else isSingular(m)
+  )
+}
+
+#### Calibration: real data vs. one simulated dataset through the identical pipeline
+real_check <- recover_effect(mutate(cells, k = k_real))
+one_sim    <- recover_effect(simulate_cells(cells, morph_pars, beta_true, sd_u_sim))
+
+bind_rows(real = real_check, simulated = one_sim, .id = "data")
+# Compare sd_inflection, r2, n_failed / n_fits, and sd_u_hat.
+# Adjust the generating parameters (see notes) until these agree.
+
+#### Many replicates
+n_sims <- 200
+
+sims <- map(seq_len(n_sims),
+            \(i) recover_effect(simulate_cells(cells, morph_pars, beta_true, sd_u_sim)),
+            .progress = TRUE) |>
+  list_rbind() |>
+  mutate(sim = row_number())
+
+sims |>
+  summarise(
+    mean_beta_hat = mean(beta_hat, na.rm = TRUE),
+    bias          = mean(beta_hat - beta_true, na.rm = TRUE),
+    sd_beta_hat   = sd(beta_hat, na.rm = TRUE),
+    coverage      = mean(abs(beta_hat - beta_true) < 1.96 * se, na.rm = TRUE),
+    mean_sd_u_hat = mean(sd_u_hat, na.rm = TRUE),
+    pct_singular  = mean(singular, na.rm = TRUE),
+    pct_failed    = mean(n_failed / n_fits)
+  )
+
+write_csv(sims, here("data", "clean", "simulation_results_sd_u_1.25.csv"))
 
 ```
 *Side-by-side graph with original graph is ideal here*
@@ -431,6 +589,17 @@ lmer(inflection ~ p_signal_right + (p_signal_right | bird), data = fits_clean)
 Any follow-up analyses desired (not required).  
 
 ## Discussion
+
+## Questions for 11/17 deadline
+What assumptions does your generative model make about participant behavior, and which aspects of the real experiment does it simplify or omit?
+
+The biggest assumption my generative model makes is that there is variation in bird level behavior similar to the variation from the original sample size. Although this experiment has a lot of data points from a lot of trials, 20 birds still isn't a lot. There could feasibly be a different spread of variation in behavior with even just a few birds behaving differently, leading to different parameters in the simulation, but this simulation only assumes the variation present in the experimental sample. The variation is also all bound in the sd_u value which is SD of the inflection shift. In the 3b plot, the logistic curve has parameters other than inflection point that also shift (intercepts, slope), but the simulation only changes the response based on inflection point shift. 
+
+Identify one insight your simulation gave you about the strengths or limitations of the original experimental design.
+
+Working with the data gave me a greater appreciation for the passive data collection aspect of the experimental design. In the past, I have had to run time intensive behavioral trials where I needed to be in the room to facilitate trials, but that wouldn't be feasible for a dataset of this size. A real strength of this design is the vast quantities of behavioral data that can be generated when a behavioral apparatus is set up to run trials without the presence of a researcher. This collection process that generates so much data allows for strong conclusions to be drawn about the experimental factors that influence behavior due to large sample sizes and trends across birds. 
+
+Remaining steps: simulate another dataset absent of the main effect for comparison, plot this null dataset for easy comparison
 
 ### Summary of Reproduction Attempt
 
